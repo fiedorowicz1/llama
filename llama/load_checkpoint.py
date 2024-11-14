@@ -1,10 +1,11 @@
 import json
 import os
-from safetensors import safe_open
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
-from torch import nn
-from torch.distributed.tensor import DTensor, distribute_tensor
 import tqdm
+from safetensors import safe_open
+from torch import nn
 
 
 def load_checkpoint(
@@ -42,17 +43,19 @@ def load_checkpoint(
     # broadcasts them to the other ranks
     # current_tp_index = 0
 
-    # Load the necessary files
-    for file in tqdm.tqdm(
-        sorted(files), desc="Loading necessary safetensors files", total=len(files)
-    ):
-        filepath = os.path.join(folder, file)
-        with safe_open(filepath, framework="pt", device=dev) as f:
-            for key in sorted(f.keys()):
-                if key in params:
-                    _load_tensor_fully_or_partially(
-                        f, key, params, tp_rank, tp_world_size
-                    )
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for file in sorted(files):
+            filepath = os.path.join(folder, file)
+            futures.append(
+                executor.submit(
+                    _load_file, filepath, params, dev, tp_rank, tp_world_size
+                )
+            )
+        for future in tqdm.tqdm(
+            futures, desc="Loading necessary safetensors files", total=len(futures)
+        ):
+            future.result()
 
 
 def _intersect_tensors(model: nn.Module, available_tensors: dict[str, str]) -> set[str]:
@@ -64,6 +67,13 @@ def _intersect_tensors(model: nn.Module, available_tensors: dict[str, str]) -> s
         if pname in available_tensors:
             result.add(available_tensors[pname])
     return result
+
+
+def _load_file(filepath, params, device, tp_rank, tp_world_size):
+    with safe_open(filepath, framework="pt", device=device) as f:
+        for key in sorted(f.keys()):
+            if key in params:
+                _load_tensor_fully_or_partially(f, key, params, tp_rank, tp_world_size)
 
 
 def _load_tensor_fully_or_partially(
@@ -81,7 +91,7 @@ def _load_tensor_fully_or_partially(
     slc = f.get_slice(key)
     param = params[key]
 
-    if isinstance(param.data, DTensor):  # Requires partial load
+    if tp_world_size > 1:  # Requires partial load
         # The following code would cause all the tensors to be loaded by tp_rank=0
         # and then broadcasted to the other ranks. We can go back to using this
         # function when PyTorch adds an optional root rank
@@ -90,10 +100,10 @@ def _load_tensor_fully_or_partially(
         # return
 
         shape = slc.get_shape()
-        param_shape = param.data._local_tensor.shape
+        param_shape = param.data.shape
         diffs = [1 if (s != sts) else 0 for s, sts in zip(param_shape, shape)]
         if sum(diffs) == 0:  # No tensor parallelism
-            param.data._local_tensor[:] = slc[:]
+            param.data[:] = slc[:]
             return
 
         # Tensor parallelism (1D)
@@ -102,7 +112,7 @@ def _load_tensor_fully_or_partially(
         tp_dim = next(i for i, d in enumerate(diffs) if d == 1)
 
         # Get the total size and compute slice offset
-        chunk_size = param.shape[tp_dim] // tp_world_size
+        chunk_size = shape[tp_dim] // tp_world_size
         chunk_offset = tp_rank * chunk_size
 
         # Prepare slice
@@ -111,7 +121,7 @@ def _load_tensor_fully_or_partially(
         ndslice[tp_dim] = slice(chunk_offset, chunk_offset + param_shape[tp_dim], 1)
 
         # Copy slice
-        param.data._local_tensor[:] = slc[tuple(ndslice)]
+        param.data[:] = slc[tuple(ndslice)]
     else:
         # Full load
         param.data[:] = slc[:]
