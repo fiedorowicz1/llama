@@ -12,10 +12,12 @@
 #
 # SPDX-License-Identifier: (Apache-2.0)
 import argparse
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 from transformers import PreTrainedTokenizer
+from transformers.cache_utils import DynamicCache
 
 from llama import DistributedLlama
 from llama.streaming import MasterRankTextStreamer
@@ -59,6 +61,62 @@ def get_args(server: bool = False):
     return parser.parse_args()
 
 
+@dataclass
+class ControlInfo:
+    exit: bool = False
+    keepalive: bool = False
+    input_len: int = 0
+    max_new_tokens: int = 0
+
+
+class CustomDynamicCache(DynamicCache):
+    """
+    A custom dynamic cache that keeps track of the sequence length from all layers.
+    The default implementation only keeps track of the sequence length for the first layer.
+    """
+
+    def get_seq_length(self, layer_idx: int = None) -> int:
+        if layer_idx is None:
+            if len(self.key_cache) == 0:
+                return 0
+            max_seq_length = max(
+                [
+                    layer_cache.shape[-2]
+                    for layer_cache in self.key_cache
+                    if len(layer_cache) > 0
+                ]
+            )
+            return max_seq_length
+
+        return super().get_seq_length(layer_idx)
+
+
+class KVCacheManager:
+    """
+    Manages the key-value cache for the model, keeping track of the previous tokens.
+    """
+
+    def __init__(self):
+        self.cached_tokens = None
+        self.kv_cache = CustomDynamicCache()
+
+    def get_cache(self, inputs, input_len):
+        if self.cached_tokens is not None:
+            # Check if the cache can be reused
+            cached_len = self.cached_tokens.shape[1]
+            if cached_len < input_len and torch.equal(
+                self.cached_tokens, inputs[:, :cached_len]
+            ):
+                return self.kv_cache
+            else:
+                self.cached_tokens = None
+                self.kv_cache = CustomDynamicCache()
+        return self.kv_cache
+
+    def update(self, outputs):
+        self.cached_tokens = outputs
+
+
 def barrier(device):
     """
     A barrier that synchronizes all ranks and is compatible with DTensor.
@@ -67,13 +125,16 @@ def barrier(device):
     dist.all_reduce(torch.tensor(0, device=device), op=dist.ReduceOp.SUM)
 
 
-def chat_synchronize_ranks(inputs, input_len, device):
+def chat_synchronize_ranks(inputs, device, info=None):
     """
     Waits for all ranks to receive the input length of the next message.
     """
     barrier(device)
+    info_list = [info]
+    dist.broadcast_object_list(info_list, 0)
     dist.broadcast(inputs, 0)
-    dist.broadcast(input_len, 0)
+
+    return info_list[0]
 
 
 def chat_loop(
@@ -98,7 +159,6 @@ def chat_loop(
     # Keep memory buffers for messages and inputs
     messages = []
     inputs = torch.full((1, 131072), 128002, dtype=torch.long, device=device)
-    input_len = torch.zeros((1,), dtype=torch.long, device=device)
 
     if args.debug and dist.get_rank() == 0:
         print("Warming up...")
@@ -120,9 +180,10 @@ def chat_loop(
         # Loop forever
         while True:
             # Ask for inputs only on the first rank
+            info = None
             if dist.get_rank() == 0:
                 if args.benchmark:
-                    message = 'benchmark'
+                    message = "benchmark"
                 else:
                     message = input("> ")
                 if message.strip() == "exit":
@@ -134,17 +195,17 @@ def chat_loop(
                     return_tensors="pt",
                 ).to(device)
                 inputs[0, : actual_inputs.shape[-1]] = actual_inputs
-                input_len[0] = actual_inputs.shape[-1]
+                info = ControlInfo(input_len=actual_inputs.shape[-1])
 
             # Synchronize the input tokens and lengths
-            chat_synchronize_ranks(inputs, input_len, device)
-            if input_len[0] == 0:
+            info = chat_synchronize_ranks(inputs, device, info)
+            if info.exit:
                 break
 
             # The crux of the chat loop: generate the response
             model.generate(
-                input_ids=inputs[:, : input_len[0]],
-                attention_mask=torch.ones((1, input_len[0]), device=device),
+                input_ids=inputs[:, : info.input_len],
+                attention_mask=torch.ones((1, info.input_len), device=device),
                 streamer=output_streamer,
                 max_new_tokens=10 if args.benchmark else args.max_tokens_per_response,
                 pad_token_id=tokenizer.eos_token_id,
@@ -171,5 +232,4 @@ def chat_loop(
         # Broadcast zeros to finalize the rest of the ranks
         if dist.get_rank() == 0:
             print("[Ending chat]")
-            input_len[:] = 0
-            chat_synchronize_ranks(inputs, input_len, device)
+            chat_synchronize_ranks(inputs, device, ControlInfo(exit=True))

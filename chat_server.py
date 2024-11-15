@@ -24,13 +24,19 @@ from fastapi.responses import StreamingResponse
 from transformers import AutoTokenizer, TextStreamer
 
 from llama import DistributedLlama, LlamaDeviceMesh
-from llama.chat_utils import barrier, chat_synchronize_ranks, get_args
+from llama.chat_utils import (
+    ControlInfo,
+    KVCacheManager,
+    barrier,
+    chat_synchronize_ranks,
+    get_args,
+)
 
 # Create a FastAPI app
 app = FastAPI()
 
 # Global variables
-input_len = inputs = model = tokenizer = lock = None
+inputs = model = tokenizer = lock = cache_manager = None
 device = torch.device("cuda:0")
 
 
@@ -48,9 +54,7 @@ class ChatServerTextStreamer(TextStreamer):
         if self.skip_prompt and self.next_tokens_are_prompt:
             # Skip both the prompt and the content header (in LLaMA 3.1, the
             # sequence separator is 128007 followed by '\n\n' which is 271)
-            if (
-                value.shape[-1] == 1
-            ):  # Skip until start of answer
+            if value.shape[-1] == 1:  # Skip until start of answer
                 if self._prev_token == 128007 and value.item() == 271:
                     self.next_tokens_are_prompt = False
                 else:
@@ -63,19 +67,24 @@ class ChatServerTextStreamer(TextStreamer):
         self.queue.put(f"data: {json.dumps(response)}\n\n")
 
 
-def generate_text(streamer, max_tokens):
+def generate_text(streamer, input_len, max_tokens):
     with lock:
         # Synchronize the input tokens and lengths
-        chat_synchronize_ranks(inputs, input_len, device)
+        control_info = ControlInfo(input_len=input_len, max_new_tokens=max_tokens)
+        chat_synchronize_ranks(inputs, device, control_info)
 
         # Generate text as a streaming response
-        model.generate(
-            input_ids=inputs[:, : input_len[0]],
-            attention_mask=torch.ones((1, input_len[0]), device=device),
+        outputs = model.generate(
+            input_ids=inputs[:, :input_len],
+            attention_mask=torch.ones((1, input_len), device=device),
             streamer=streamer,
             max_new_tokens=max_tokens,
             pad_token_id=tokenizer.eos_token_id,
+            past_key_values=cache_manager.get_cache(inputs, input_len),
         )
+
+        # Update the cached tokens
+        cache_manager.update(outputs)
 
         # Send signal to end the stream
         streamer.queue.put(None)
@@ -97,15 +106,14 @@ async def completions(request: Request):
         return_tensors="pt",
     ).to(device)
     inputs[0, : actual_inputs.shape[-1]] = actual_inputs
-    input_len[0] = actual_inputs.shape[-1]
-    input_len[1] = max_tokens
+    input_len = actual_inputs.shape[-1]
 
     streamer_queue = queue.Queue()
     streamer = ChatServerTextStreamer(tokenizer, streamer_queue)
 
     # Generate text
     threading.Thread(
-        target=generate_text, args=(streamer, max_tokens), daemon=True
+        target=generate_text, args=(streamer, input_len, max_tokens), daemon=True
     ).start()
 
     def content_stream():
@@ -125,17 +133,19 @@ async def completions(request: Request):
 
 
 def event_loop():
-    chat_synchronize_ranks(inputs, input_len, device)
-    while input_len[0] >= 0:
-        if input_len[0] > 0:
-            model.generate(
-                input_ids=inputs[:, : input_len[0]],
-                attention_mask=torch.ones((1, input_len[0]), device=device),
+    info: ControlInfo = chat_synchronize_ranks(inputs, device)
+    while not info.exit:
+        if not info.keepalive:
+            outputs = model.generate(
+                input_ids=inputs[:, : info.input_len],
+                attention_mask=torch.ones((1, info.input_len), device=device),
                 streamer=None,
-                max_new_tokens=input_len[1],
+                max_new_tokens=info.max_new_tokens,
                 pad_token_id=tokenizer.eos_token_id,
+                past_key_values=cache_manager.get_cache(inputs, info.input_len),
             )
-        chat_synchronize_ranks(inputs, input_len, device)
+            cache_manager.update(outputs)
+        info = chat_synchronize_ranks(inputs, device)
 
 
 @app.get("/models")
@@ -151,15 +161,13 @@ async def models():
     }
 
 
-def keepalive_signal(inputs, input_len, device, lock, interval_minutes=5):
+def keepalive_signal(inputs, device, lock, interval_minutes=5):
     """Send a keepalive signal from rank 0 to other ranks every `interval_minutes`."""
     inputs = torch.empty_like(inputs)
-    input_len = torch.empty_like(input_len)
-    input_len[0] = 0
     while True:
         time.sleep(interval_minutes * 60)
         with lock:
-            chat_synchronize_ranks(inputs, input_len, device)
+            chat_synchronize_ranks(inputs, device, ControlInfo(keepalive=True))
 
 
 def main():
@@ -203,9 +211,11 @@ def main():
         pad_token_id=tokenizer.eos_token_id,
     )
 
-    global inputs, input_len
+    global inputs
     inputs = torch.full((1, 131072), 128002, dtype=torch.long, device=device)
-    input_len = torch.zeros((2,), dtype=torch.long, device=device)
+
+    global cache_manager
+    cache_manager = KVCacheManager()
 
     # Run the uvicorn server
     if dist.get_rank() == 0:
@@ -213,7 +223,7 @@ def main():
         global lock
         lock = threading.Lock()
         keepalive_thread = threading.Thread(
-            target=keepalive_signal, args=(inputs, input_len, device, lock)
+            target=keepalive_signal, args=(inputs, device, lock)
         )
         keepalive_thread.daemon = True
         keepalive_thread.start()
@@ -228,8 +238,7 @@ def main():
         print("Loop is over")
 
         # Tear down the process group
-        input_len[0] = -1
-        chat_synchronize_ranks(inputs, input_len, device)
+        chat_synchronize_ranks(inputs, device, ControlInfo(exit=True))
     else:
         # Other ranks participate in the chat server by waiting
         event_loop()
