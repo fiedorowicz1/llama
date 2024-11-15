@@ -12,14 +12,51 @@
 #
 # SPDX-License-Identifier: (Apache-2.0)
 import argparse
-import time
+
 import torch
 import torch.distributed as dist
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
-from llama import DistributedLlama, LlamaDeviceMesh
+from llama import DistributedLlama
 from llama.streaming import MasterRankTextStreamer
-from llama.chat_utils import *
+
+
+def get_args(server: bool = False):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-dir", type=str, default=None)
+    parser.add_argument(
+        "--pp",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--max-tokens-per-response",
+        type=int,
+        default=1024,
+    )
+    parser.add_argument(
+        "--io-threads",
+        type=int,
+        default=0,
+    )
+    if server:
+        parser.add_argument("--port", type=int, default=8123)
+    return parser.parse_args()
 
 
 def barrier(device):
@@ -74,7 +111,10 @@ def chat_loop(
     )
 
     if dist.get_rank() == 0:
-        print("Type a message to start the chat.")
+        print(
+            "Type a message to start the chat.",
+            "Press ctrl-D or type 'exit' to end the conversation.",
+        )
 
     try:
         # Loop forever
@@ -127,53 +167,3 @@ def chat_loop(
             print("[Ending chat]")
             input_len[:] = 0
             chat_synchronize_ranks(inputs, input_len, device)
-
-
-def main():
-    args = get_args()
-
-    device = torch.device("cuda:0")
-    dist.init_process_group("nccl")
-    device_mesh = LlamaDeviceMesh(
-        tensor_parallel=dist.get_world_size() // args.pp, pipeline_parallel=args.pp
-    )
-    if args.debug:
-        print(
-            f"Device mesh: rank={dist.get_rank()},",
-            f"TP={device_mesh.tp_rank()}/{device_mesh.tp_size()},",
-            f"PP={device_mesh.pp_rank()}/{device_mesh.pp_size()}",
-        )
-
-    # Choose the number of I/O threads automatically
-    io_threads = args.io_threads if args.io_threads > 0 else device_mesh.tp_size()
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    model = DistributedLlama(
-        args.model_dir,
-        device,
-        device_mesh,
-        delay_init=True,
-        load_checkpoint=not args.benchmark,
-        io_threads=io_threads,
-    )
-    barrier(device)
-
-    # Print how much memory is used by the GPU
-    if dist.get_rank() == 0 and (args.debug or args.benchmark):
-        print("Memory used:", torch.cuda.memory_allocated() / 1024**3, "GiB")
-
-    if args.compile:
-        model.model.forward = torch.compile(
-            model.model.forward
-        )  # , mode="reduce-overhead")
-
-    output_streamer = MasterRankTextStreamer(
-        tokenizer, skip_special_tokens=True, skip_prompt=not args.benchmark
-    )
-    chat_loop(model, tokenizer, device, output_streamer, args)
-
-    dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()
