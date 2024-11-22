@@ -67,6 +67,14 @@ class ControlInfo:
     keepalive: bool = False
     input_len: int = 0
     max_new_tokens: int = 0
+    temperature: float = None
+
+    def to_kwargs(self):
+        result = {}
+        if self.temperature is not None:
+            result["temperature"] = self.temperature
+
+        return result
 
 
 class CustomDynamicCache(DynamicCache):

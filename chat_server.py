@@ -75,11 +75,16 @@ class ChatServerTextStreamer(TextStreamer):
         self.queue.put(f"data: {json.dumps(response)}\n\n")
 
 
-def generate_text(streamer, input_len, max_tokens):
+def generate_text(streamer, input_len, max_tokens, settings):
     with lock:
         # Synchronize the input tokens and lengths
-        control_info = ControlInfo(input_len=input_len, max_new_tokens=max_tokens)
+        control_info = ControlInfo(
+            input_len=input_len,
+            max_new_tokens=max_tokens,
+            temperature=settings.get("temperature", None),
+        )
         chat_synchronize_ranks(inputs, device, control_info)
+        kwargs = control_info.to_kwargs()
 
         # Generate text as a streaming response
         outputs = model.generate(
@@ -89,6 +94,7 @@ def generate_text(streamer, input_len, max_tokens):
             max_new_tokens=max_tokens,
             pad_token_id=tokenizer.eos_token_id,
             past_key_values=cache_manager.get_cache(inputs, input_len),
+            **kwargs,
         )
 
         # Update the cached tokens
@@ -108,6 +114,9 @@ async def completions(request: Request):
     messages = request_body.get("messages", [])
     max_tokens = request_body.get("max_tokens", 512)
     stream = request_body.get("stream", False)
+    settings = {}
+    if "temperature" in request_body:
+        settings["temperature"] = request_body.get("temperature")
 
     actual_inputs = tokenizer.apply_chat_template(
         messages,
@@ -121,7 +130,9 @@ async def completions(request: Request):
 
     # Generate text
     threading.Thread(
-        target=generate_text, args=(streamer, input_len, max_tokens), daemon=True
+        target=generate_text,
+        args=(streamer, input_len, max_tokens, settings),
+        daemon=True,
     ).start()
 
     def content_stream():
@@ -144,6 +155,8 @@ def event_loop():
     info: ControlInfo = chat_synchronize_ranks(inputs, device)
     while not info.exit:
         if not info.keepalive:
+            kwargs = info.to_kwargs()
+
             outputs = model.generate(
                 input_ids=inputs[:, : info.input_len],
                 attention_mask=torch.ones((1, info.input_len), device=device),
@@ -151,6 +164,7 @@ def event_loop():
                 max_new_tokens=info.max_new_tokens,
                 pad_token_id=tokenizer.eos_token_id,
                 past_key_values=cache_manager.get_cache(inputs, info.input_len),
+                **kwargs,
             )
             cache_manager.update(outputs)
         info = chat_synchronize_ranks(inputs, device)
@@ -241,7 +255,7 @@ def main():
 
         print("Running server on", socket.gethostname())
 
-        uvicorn.run(app, host="0.0.0.0", port=args.port)
+        uvicorn.run(app, host=socket.gethostname(), port=args.port)
 
         print("Loop is over")
 
