@@ -21,26 +21,51 @@ import openai
 def chat_loop(model: str, url: str):
     conversation = []
     client = openai.OpenAI(api_key="None", base_url=url)
+    temperature = openai.NOT_GIVEN
 
     print(
         "Type a message to start the chat.",
         "Press ctrl-D or type 'exit' to end the conversation.",
         "Type 'clear' to clear the chat context.",
+        "Type 'help' to see the list of available commands.",
     )
 
     try:
         while True:
             message = input("> ")
+
+            # Commands
+            if message.strip() == "help":
+                print(
+                    "Commands:\n",
+                    "  help: Show this help message\n",
+                    "  exit: End the conversation\n",
+                    "  clear: Clear the chat context\n",
+                    "  temp <float>: Set the temperature for the model",
+                )
+                continue
             if message.strip() == "exit":
                 raise EOFError
             if message.strip() == "clear":
                 print("[Chat context cleared]")
                 conversation = []
                 continue
+            if message.startswith("temp "):
+                try:
+                    temperature = float(message.split(" ")[1])
+                    if temperature <= 0 or temperature > 1:
+                        raise ValueError
+                    print(f"[Temperature set to {temperature}]")
+                except ValueError:
+                    print("[Invalid temperature. Should be a positive number less than 1]")
+                continue
             conversation.append({"role": "user", "content": message})
 
             chat_completion = client.chat.completions.create(
-                model=model, messages=conversation, stream=True
+                model=model,
+                messages=conversation,
+                stream=True,
+                temperature=temperature,
             )
             full_response = ""
             for chunk in chat_completion:
