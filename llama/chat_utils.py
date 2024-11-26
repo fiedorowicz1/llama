@@ -119,7 +119,7 @@ class PipelineStaticCache(StaticCache):
         model: DistributedLlama,
         batch_size: int = 1,
         dtype=torch.bfloat16,
-        max_cache_len=1024,
+        max_cache_len=2048,
     ):
         count = 0
         self.layer_map = [0] * len(model.model.model.layers)
