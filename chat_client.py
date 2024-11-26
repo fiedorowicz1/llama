@@ -45,7 +45,7 @@ def chat_loop(model: str, url: str, args):
                         "  /clear: Clear the chat context\n",
                         "  /temp <float>: Set the temperature for the model\n",
                         "  /tokens <int>: Set the maximal number of tokens to use per response\n",
-                        "  /cq <prompt>: Prefix message with custom prompt",
+                        "  /cq <prompt>: Prefix <prompt> with custom prompt given by --custom-prompt <FILE>",
                     )
                     continue
                 elif command == "exit":
