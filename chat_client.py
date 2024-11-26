@@ -18,16 +18,16 @@ import argparse
 import openai
 
 
-def chat_loop(model: str, url: str):
+def chat_loop(model: str, url: str, args):
     conversation = []
     client = openai.OpenAI(api_key="None", base_url=url)
     temperature = openai.NOT_GIVEN
 
     print(
         "Type a message to start the chat.",
-        "Press ctrl-D or type 'exit' to end the conversation.",
-        "Type 'clear' to clear the chat context.",
-        "Type 'help' to see the list of available commands.",
+        "Press ctrl-D or type '/exit' to end the conversation.",
+        "Type '/clear' to clear the chat context.",
+        "Type '/help' to see the list of available commands.",
     )
 
     try:
@@ -35,30 +35,60 @@ def chat_loop(model: str, url: str):
             message = input("> ")
 
             # Commands
-            if message.strip() == "help":
-                print(
-                    "Commands:\n",
-                    "  help: Show this help message\n",
-                    "  exit: End the conversation\n",
-                    "  clear: Clear the chat context\n",
-                    "  temp <float>: Set the temperature for the model",
-                )
-                continue
-            if message.strip() == "exit":
-                raise EOFError
-            if message.strip() == "clear":
-                print("[Chat context cleared]")
-                conversation = []
-                continue
-            if message.startswith("temp "):
-                try:
-                    temperature = float(message.split(" ")[1])
-                    if temperature <= 0 or temperature > 1:
-                        raise ValueError
-                    print(f"[Temperature set to {temperature}]")
-                except ValueError:
-                    print("[Invalid temperature. Should be a positive number less than 1]")
-                continue
+            if message.strip().startswith("/"):
+                command = message[1:].strip()
+                if command == "help":
+                    print(
+                        "Commands:\n",
+                        "  /help: Show this help message\n",
+                        "  /exit: End the conversation\n",
+                        "  /clear: Clear the chat context\n",
+                        "  /temp <float>: Set the temperature for the model\n",
+                        "  /tokens <int>: Set the maximal number of tokens to use per response\n",
+                        "  /cq <prompt>: Prefix message with custom prompt",
+                    )
+                    continue
+                elif command == "exit":
+                    raise EOFError
+                elif command == "clear":
+                    print("[Chat context cleared]")
+                    conversation = []
+                    continue
+                elif command.startswith("temp "):
+                    try:
+                        temperature = float(command.split(" ")[1])
+                        if temperature <= 0 or temperature > 1:
+                            raise ValueError
+                        print(f"[Temperature set to {temperature}]")
+                    except ValueError:
+                        print(
+                            "[Invalid temperature. Should be a positive number less than 1]"
+                        )
+                    continue
+                elif command.startswith("tokens "):
+                    try:
+                        tokens = int(command.split(" ")[1])
+                        if tokens < 0 or tokens > 131000:
+                            raise ValueError
+                        print(f"[Tokens set to {tokens}]")
+                        args.max_tokens = tokens
+                    except ValueError:
+                        print(
+                            "[Invalid number of tokens. Should be a positive number less than 131,000]"
+                        )
+                    continue
+                elif command.startswith("cq "):
+                    if args.custom_prompt is None:
+                        print("[Error: a custom prompt has not been provided, use --custom-prompt]")
+                        continue
+                    message = command[len("cq "):]
+                    new_message = open(args.custom_prompt, "r").read()
+                    new_message += message + "]"
+                    message = new_message
+                else:
+                    print(f"Invalid command '{command}'")
+                    continue
+
             conversation.append({"role": "user", "content": message})
 
             chat_completion = client.chat.completions.create(
@@ -66,6 +96,7 @@ def chat_loop(model: str, url: str):
                 messages=conversation,
                 stream=True,
                 temperature=temperature,
+                max_tokens=args.max_tokens,
             )
             full_response = ""
             for chunk in chat_completion:
@@ -85,9 +116,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="LLLama")
     parser.add_argument("--url", type=str, default="http://localhost:8123")
+    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--custom-prompt", type=str, default=None)
+
 
     args = parser.parse_args()
-    chat_loop(args.model, args.url)
+    chat_loop(args.model, args.url, args)
 
 
 if __name__ == "__main__":
