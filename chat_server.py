@@ -46,7 +46,7 @@ Process().cpu_affinity(affinity)
 app = FastAPI()
 
 # Global variables
-inputs = model = tokenizer = gen_queue = cache_manager = None
+inputs = model = tokenizer = gen_queue = None
 device = torch.device("cuda:0")
 
 
@@ -245,6 +245,7 @@ def master_loop(inputs, device, gen_queue, interval_minutes=5):
 
 
 def worker_loop():
+    cache_manager = KVCacheManager(model)
     info: ControlInfo = chat_synchronize_ranks(inputs, device)
     while info.message != ControlMessageType.EXIT:
         if info.message != ControlMessageType.KEEPALIVE:
@@ -307,13 +308,10 @@ def main():
     global inputs
     inputs = torch.full((1, 131072), 128002, dtype=torch.long, device=device)
 
-    global cache_manager
-    cache_manager = KVCacheManager(model)
-
     if args.compile:
         model.model.original_forward = model.model.forward
         model.model.compiled_forward = torch.compile(
-            model.model.forward, mode="reduce-overhead", fullgraph=True
+            model.model.forward, mode="reduce-overhead", dynamic=True
         )
 
     # Run the uvicorn server

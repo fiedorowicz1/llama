@@ -162,8 +162,13 @@ class KVCacheManager:
 
     def __init__(self, model: DistributedLlama):
         self.model = model
+        self.compiled = hasattr(self.model.model, "compiled_forward")
+
+        if self.compiled:
+            self.static_cache = PipelineStaticCache(self.model)
+
         self.cached_tokens = None
-        self.kv_cache = PipelineStaticCache(self.model)
+        self.kv_cache = self.static_cache if self.compiled else PipelineDynamicCache()
 
     def get_cache(self, inputs, input_len, max_new_tokens):
         # Check if the cache can be reused
@@ -174,7 +179,11 @@ class KVCacheManager:
                 and torch.equal(self.cached_tokens, inputs[:, :cached_len])
             ):
                 print("Cache miss")
-                self.clear()
+                self.cached_tokens = None
+                if self.compiled:
+                    self.clear()
+                else:
+                    self.kv_cache = PipelineDynamicCache()
             else:
                 print("Cache hit")
 
@@ -184,10 +193,11 @@ class KVCacheManager:
         ) and self.kv_cache.max_cache_len < (input_len + max_new_tokens):
             print("Switching to dynamic cache")
             self.cached_tokens = None
+            self.kv_cache.reset()
             self.kv_cache = PipelineDynamicCache()
 
         # Switch to compiled forward if available
-        if hasattr(self.model.model, "compiled_forward"):
+        if self.compiled:
             if isinstance(self.kv_cache, PipelineStaticCache):
                 self.model.model.forward = self.model.model.compiled_forward
             else:
