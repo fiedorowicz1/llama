@@ -127,6 +127,7 @@ async def completions(request: Request):
 
     # Return a streaming response
     if stream:
+
         async def content_stream(request: Request):
             try:
                 while True:
@@ -207,7 +208,9 @@ def master_loop(inputs, device, gen_queue, interval_minutes=5):
             task = gen_queue.get(timeout=interval_minutes * 60)
             # Check for shutdown signal
             if task is None:
-                chat_synchronize_ranks(inputs, device, ControlInfo(message=ControlMessageType.EXIT))
+                chat_synchronize_ranks(
+                    inputs, device, ControlInfo(message=ControlMessageType.EXIT)
+                )
                 return
             input_len, max_tokens, settings, streamer = task
 
@@ -238,10 +241,15 @@ def master_loop(inputs, device, gen_queue, interval_minutes=5):
             streamer.queue.put(None)
         except queue.Empty:
             # Send a keepalive signal
-            chat_synchronize_ranks(inputs, device, ControlInfo(message=ControlMessageType.KEEPALIVE))
+            chat_synchronize_ranks(
+                inputs, device, ControlInfo(message=ControlMessageType.KEEPALIVE)
+            )
         except StopIteration:  # Chat interrupted
             # Clear KV cache on interruption
             cache_manager.clear()
+
+            # Send signal to end the stream
+            streamer.queue.put(None)
 
 
 def worker_loop():
@@ -259,8 +267,8 @@ def worker_loop():
                     max_new_tokens=info.max_new_tokens,
                     pad_token_id=tokenizer.eos_token_id,
                     past_key_values=cache_manager.get_cache(
-                    inputs, info.input_len, info.max_new_tokens
-                ),
+                        inputs, info.input_len, info.max_new_tokens
+                    ),
                     **kwargs,
                 )
                 cache_manager.update(outputs)
