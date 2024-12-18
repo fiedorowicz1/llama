@@ -153,6 +153,20 @@ class PipelineStaticCache(StaticCache):
         layer_idx = self.remap_layer(layer_idx)
         return super().update(key_states, value_states, layer_idx, cache_kwargs)
 
+    def to_dynamic_cache(self, model: DistributedLlama):
+        cache = PipelineDynamicCache()
+        cache.key_cache = [[] for _ in range(len(self.layer_map))]
+        cache.value_cache = [[] for _ in range(len(self.layer_map))]
+        seq_len = self.get_seq_length()
+        for i, layer in enumerate(model.model.model.layers):
+            if isinstance(layer, LlamaDecoderLayer):
+                cache.key_cache[i] = self.key_cache[self.remap_layer(i)][:, :, :seq_len]
+                cache.value_cache[i] = self.value_cache[self.remap_layer(i)][
+                    :, :, :seq_len
+                ]
+
+        return cache
+
 
 class KVCacheManager:
     """
@@ -167,8 +181,7 @@ class KVCacheManager:
         if self.compiled:
             self.static_cache = PipelineStaticCache(self.model)
 
-        self.cached_tokens = None
-        self.kv_cache = self.static_cache if self.compiled else PipelineDynamicCache()
+        self.clear()
 
     def get_cache(self, inputs, input_len, max_new_tokens):
         # Check if the cache can be reused
@@ -179,11 +192,7 @@ class KVCacheManager:
                 and torch.equal(self.cached_tokens, inputs[:, :cached_len])
             ):
                 print("Cache miss")
-                self.cached_tokens = None
-                if self.compiled:
-                    self.clear()
-                else:
-                    self.kv_cache = PipelineDynamicCache()
+                self.clear()
             else:
                 print("Cache hit")
 
@@ -192,15 +201,15 @@ class KVCacheManager:
             self.kv_cache, PipelineStaticCache
         ) and self.kv_cache.max_cache_len < (input_len + max_new_tokens):
             print("Switching to dynamic cache")
-            self.cached_tokens = None
-            self.kv_cache.reset()
-            self.kv_cache = PipelineDynamicCache()
+            self.kv_cache = self.kv_cache.to_dynamic_cache(self.model)
 
         # Switch to compiled forward if available
         if self.compiled:
             if isinstance(self.kv_cache, PipelineStaticCache):
+                print("Using compiled forward")
                 self.model.model.forward = self.model.model.compiled_forward
             else:
+                print("Using original forward")
                 self.model.model.forward = self.model.model.original_forward
 
         return self.kv_cache
@@ -210,7 +219,12 @@ class KVCacheManager:
 
     def clear(self):
         self.cached_tokens = None
-        self.kv_cache = PipelineStaticCache(self.model)
+
+        if self.compiled:
+            self.static_cache.reset()
+            self.kv_cache = self.static_cache
+        else:
+            self.kv_cache = PipelineDynamicCache()
 
 
 def barrier(device):
