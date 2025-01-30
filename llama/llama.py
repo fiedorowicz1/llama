@@ -75,6 +75,9 @@ class DistributedLlama(nn.Module):
             self.model.to(dtype)
             self.model.eval()
 
+            # Prevent HF from applying its own compile step
+            self.model.get_compiled_call = lambda _: self.model.__call__
+
         # Setup tensor parallel model sharding
         if device_mesh.tp_size() > 1:
             self._shard_model()
@@ -126,21 +129,16 @@ class DistributedLlama(nn.Module):
             }
             parallelize_module(layer, self.device_mesh, block_plan)
 
-            # Adjust the number of local heads
-            layer.self_attn.num_heads = (
-                layer.self_attn.num_heads // self.device_mesh.tp_size()
-            )
-
-            layer.self_attn.num_key_value_heads = (
-                layer.self_attn.num_key_value_heads // self.device_mesh.tp_size()
-            )
-
         # Shard the model embedding and output layers
         model_plan = {
             "model.embed_tokens": EmbedParallel(),
         }
         parallelize_module(self.model, self.device_mesh, model_plan)
 
+        # Adjust the number of local heads
+        self.model.config.num_attention_heads = (
+            self.model.config.num_attention_heads // self.device_mesh.tp_size()
+        )
         self.model.config.num_key_value_heads = (
             self.model.config.num_key_value_heads // self.device_mesh.tp_size()
         )

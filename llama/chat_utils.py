@@ -117,7 +117,7 @@ class PipelineStaticCache(StaticCache):
     def __init__(
         self,
         model: DistributedLlama,
-        batch_size: int = 1,
+        max_batch_size: int = 1,
         dtype=torch.bfloat16,
         max_cache_len=2048,
     ):
@@ -133,7 +133,10 @@ class PipelineStaticCache(StaticCache):
         config.max_position_embeddings = max_cache_len
 
         super().__init__(
-            config, batch_size=batch_size, dtype=dtype, device=model.model.device
+            config,
+            max_batch_size=max_batch_size,
+            dtype=dtype,
+            device=model.model.device,
         )
 
     def remap_layer(self, layer_idx: int):
