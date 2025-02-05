@@ -15,6 +15,7 @@
 A simple streaming chat client based on the openai library.
 """
 import argparse
+import readline
 import openai
 
 
@@ -33,6 +34,7 @@ def chat_loop(model: str, url: str, args):
     try:
         while True:
             message = input("> ")
+            readline.add_history(message)
 
             # Commands
             if message.strip().startswith("/"):

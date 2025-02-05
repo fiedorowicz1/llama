@@ -204,8 +204,17 @@ async def completions(request: Request):
             # res = 'data: {"choices": [{"delta": {"role": "assistant", "content": "?"}}]}'
             # but we want to store just the content
             outputs.append(res.split(strip_str)[1][:-7])
+
+        msg = {"choices": [{"message": {
+                            "role": "assistant",
+                            "content": "".join(outputs),
+                            },
+                            "finish_reason": "stop"}],
+                "usage": {"completion_tokens": len(outputs),
+                          "prompt_tokens": input_len,
+                          "total_tokens": (input_len + len(outputs))}}
         # Return the collected outputs as a single response
-        return {"choices": [{"message": "".join(outputs)}]}
+        return msg
 
 
 class EventLoopTextStreamer(TextStreamer):
@@ -283,7 +292,8 @@ def keepalive_signal(inputs, device, lock, interval_minutes=5):
 def main():
     args = get_args(server=True)
 
-    dist.init_process_group("nccl")
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
     device_mesh = LlamaDeviceMesh(
         tensor_parallel=dist.get_world_size() // args.pp, pipeline_parallel=args.pp
     )

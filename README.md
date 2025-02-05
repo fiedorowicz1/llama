@@ -1,3 +1,11 @@
+# LLaMa Repository
+
+Distributed implementation of the LLaMa 3.x model.  Optimzied to allow both
+pipeline and tensor parallel inference execution using PyTorch.
+
+```
+torchrun-hpc -N1 -n2 --rdv tcp chat_server.py --model-dir <path/to/model>
+```
 # LBANN: Livermore Big Artificial Neural Network Toolkit
 
 The Livermore Big Artificial Neural Network toolkit (LBANN) is an
@@ -11,11 +19,6 @@ parallelism and ensemble training methods for training large neural
 networks with massive amounts of data.  LBANN is able to advantage of
 tightly-coupled accelerators, low-latency high-bandwidth networking,
 and high-bandwidth parallel file systems.
-
-## LLaMa Repository
-
-Distributed implementation of the LLaMa 3.x model.  Optimzied to allow both
-pipeline and tensor parallel inference execution using PyTorch.
 
 ## Publications
 
