@@ -1,6 +1,6 @@
-# LLaMa Repository
+# LLaMA Repository
 
-Distributed implementation of the LLaMa 3.x model.  Optimzied to allow both
+Distributed implementation of the LLaMA 3.x model.  Optimzied to allow both
 pipeline and tensor parallel inference execution using PyTorch.
 
 ```
