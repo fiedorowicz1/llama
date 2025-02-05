@@ -15,7 +15,10 @@
 A simple streaming chat client based on the openai library.
 """
 import argparse
+import atexit
+import os
 import openai
+import readline
 
 
 def chat_loop(model: str, url: str, args):
@@ -28,7 +31,17 @@ def chat_loop(model: str, url: str, args):
         "Press ctrl-D or type '/exit' to end the conversation.",
         "Type '/clear' to clear the chat context.",
         "Type '/help' to see the list of available commands.",
+        "Commands are stored in history file <pwd>/lbann_llama.hist",
     )
+
+    histfile = "lbann_llama.hist"
+    try:
+        readline.read_history_file(histfile)
+        readline.set_history_length(1000)
+    except FileNotFoundError:
+        pass
+
+    atexit.register(readline.write_history_file, histfile)
 
     try:
         while True:
