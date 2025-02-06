@@ -49,6 +49,7 @@ def get_args(server: bool = False):
         action="store_true",
         default=False,
     )
+    parser.add_argument("--static-cache-size", action="store", type=int, default=0)
     parser.add_argument(
         "--max-tokens-per-response",
         type=int,
@@ -179,10 +180,12 @@ class KVCacheManager:
 
     def __init__(self, model: DistributedLlama):
         self.model = model
-        self.compiled = hasattr(self.model.model, "compiled_forward")
+        self.use_static_cache = hasattr(self.model.model, "static_cache_forward")
 
-        if self.compiled:
-            self.static_cache = PipelineStaticCache(self.model)
+        if self.use_static_cache:
+            self.static_cache = PipelineStaticCache(
+                self.model, max_cache_len=model.static_cache_size
+            )
 
         self.clear()
 
@@ -207,10 +210,10 @@ class KVCacheManager:
             self.kv_cache = self.kv_cache.to_dynamic_cache(self.model)
 
         # Switch to compiled forward if available
-        if self.compiled:
+        if self.use_static_cache:
             if isinstance(self.kv_cache, PipelineStaticCache):
-                print("Using compiled forward")
-                self.model.model.forward = self.model.model.compiled_forward
+                print("Using static cache forward")
+                self.model.model.forward = self.model.model.static_cache_forward
             else:
                 print("Using original forward")
                 self.model.model.forward = self.model.model.original_forward
@@ -223,7 +226,7 @@ class KVCacheManager:
     def clear(self):
         self.cached_tokens = None
 
-        if self.compiled:
+        if self.use_static_cache:
             self.static_cache.reset()
             self.kv_cache = self.static_cache
         else:

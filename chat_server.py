@@ -317,10 +317,14 @@ def main():
     inputs = torch.full((1, 131072), 128002, dtype=torch.long, device=device)
 
     if args.compile:
-        model.model.original_forward = model.model.forward
-        model.model.compiled_forward = torch.compile(
-            model.model.forward, mode="reduce-overhead", dynamic=True
-        )
+        model.model.forward = torch.compile(model.model.forward)
+
+        if args.static_cache_size > 0:
+            model.model.original_forward = model.model.forward
+            model.model.static_cache_forward = torch.compile(
+                model.model.forward, mode="reduce-overhead", dynamic=True
+            )
+            model.static_cache_size = args.static_cache_size
 
     # Run the uvicorn server
     if dist.get_rank() == 0:
