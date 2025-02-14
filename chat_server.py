@@ -17,14 +17,14 @@ from psutil import Process
 affinity = Process().cpu_affinity()
 
 import asyncio
+import atexit
 import json
+import os
 import queue
+import sys
 import threading
 import time
-import os
 from dataclasses import dataclass
-import sys
-import atexit
 
 import torch
 import torch.distributed as dist
@@ -53,8 +53,7 @@ app = FastAPI()
 model = tokenizer = None
 device = torch.device("cuda:0")
 max_batch_size = None
-streaming_request_queue: queue.Queue = None
-nonstreaming_request_queue: queue.Queue = None
+request_queue: queue.Queue = None
 
 
 @dataclass
@@ -66,7 +65,7 @@ class ChatRequest:
     inputs: list[int]
     max_tokens: int
     settings: dict[str, float]
-    streamer_queue: queue.Queue
+    response_queue: queue.Queue
     message_queue: queue.Queue
 
 
@@ -119,10 +118,10 @@ class ChatServerTextStreamer(TextStreamer):
         v = self.tokenizer.batch_decode(value, skip_special_tokens=True)
 
         for i, q in enumerate(self.queues):
-            response = {
-                "choices": [{"delta": {"role": "assistant", "content": str(v[i])}}]
-            }
-            q.put(f"data: {json.dumps(response)}\n\n")
+            if value[i].item() == self.tokenizer.eos_token_id:
+                q.put(None)
+            else:
+                q.put(str(v[i]))
 
     def on_finalized_text(self, _: str, stream_end: bool = False):
         if stream_end:
@@ -150,65 +149,53 @@ async def completions(request: Request):
     inputs = actual_inputs.flatten().tolist()
     input_len = len(inputs)
 
-    streamer_queue = queue.Queue()
+    response_queue = queue.Queue()
     message_queue = queue.Queue()
     chat_request = ChatRequest(
-        inputs, max_tokens, settings, streamer_queue, message_queue
+        inputs, max_tokens, settings, response_queue, message_queue
     )
+
+    request_queue.put(chat_request)
+
+    async def get_tokens(request: Request):
+        try:
+            while True:
+                await asyncio.sleep(0.001)  # Yield execution
+
+                # Check if the client has disconnected
+                if await request.is_disconnected():
+                    print("Client has disconnected")
+                    message_queue.put(None)
+                    response_queue.get()  # Get final signal
+                    break
+                try:
+                    res = response_queue.get(block=False)
+                    if res is None:
+                        break
+                    yield res
+                except queue.Empty:
+                    pass
+
+        except asyncio.CancelledError:
+            print("Chat was interrupted")
+            message_queue.put(None)
+            response_queue.get()  # Get final signal
 
     # Return a streaming response
     if stream:
-        streaming_request_queue.put(chat_request)
 
-        async def content_stream(request: Request):
-            try:
-                while True:
-                    await asyncio.sleep(0.001)  # Yield execution
+        async def content_stream(request):
+            async for token in get_tokens(request):
+                response = {
+                    "choices": [{"delta": {"role": "assistant", "content": token}}],
+                }
+                yield f"data: {json.dumps(response)}\n\n"
 
-                    # Check if the client has disconnected
-                    if await request.is_disconnected():
-                        print("Client has disconnected")
-                        message_queue.put(None)
-                        streamer_queue.get()  # Get final signal
-                        break
-                    try:
-                        res = streamer_queue.get(block=False)
-                        if res is None:
-                            break
-                        yield res
-                    except queue.Empty:
-                        pass
-
-            except asyncio.CancelledError:
-                print("Chat stream was interrupted")
-                message_queue.put(None)
-                streamer_queue.get()  # Get final signal
-
-        # Return a streaming response
         return StreamingResponse(
             content=content_stream(request), media_type="text/event-stream"
         )
     else:
-        nonstreaming_request_queue.put(chat_request)
-
-        strip_str = 'data: {"choices": [{"delta": {"role": "assistant", "content": "'
-        outputs = []
-        # Collect all outputs
-        output_tokens = 0
-        while True:
-            await asyncio.sleep(0.001)  # Yield execution
-
-            try:
-                res = streamer_queue.get(block=False)
-                if res is None:
-                    break
-                # res is a string that looks like a json object e.g.
-                # res = 'data: {"choices": [{"delta": {"role": "assistant", "content": "?"}}]}'
-                # but we want to store just the content
-                outputs.append(res.split(strip_str)[1][:-7])
-                output_tokens += 1
-            except queue.Empty:
-                continue
+        outputs = [token async for token in get_tokens(request)]
         msg = {
             "choices": [
                 {
@@ -220,9 +207,9 @@ async def completions(request: Request):
                 }
             ],
             "usage": {
-                "completion_tokens": output_tokens,
+                "completion_tokens": len(outputs),
                 "prompt_tokens": input_len,
-                "total_tokens": (input_len + output_tokens),
+                "total_tokens": (input_len + len(outputs)),
             },
         }
         # Return the collected outputs as a single response
@@ -262,9 +249,7 @@ async def models():
     }
 
 
-def aggregate_tasks(
-    request_queue: queue.Queue, max_batch_size: int, interval_minutes: int
-):
+def aggregate_tasks(request_queue: queue.Queue, max_batch_size: int):
     """
     Aggregate tasks from the request queue and process them in a batch.
     """
@@ -272,7 +257,7 @@ def aggregate_tasks(
     # Process up to `max_batch_size` requests
     print("Queue size:", request_queue.qsize())
     while request_queue.qsize() > 0:
-        requests.append(request_queue.get(timeout=interval_minutes * 60))
+        requests.append(request_queue.get())
 
         # Check for shutdown signal
         if requests[-1] is None:
@@ -296,7 +281,7 @@ def aggregate_tasks(
         settings.update(request.settings)
 
     message_queues = [x.message_queue for x in requests]
-    streamer_queues = [x.streamer_queue for x in requests]
+    response_queues = [x.response_queue for x in requests]
     input_lengths = [len(x.inputs) for x in requests]
 
     return (
@@ -304,7 +289,7 @@ def aggregate_tasks(
         max_tokens,
         settings,
         message_queues,
-        streamer_queues,
+        response_queues,
         input_lengths,
     )
 
@@ -312,8 +297,7 @@ def aggregate_tasks(
 def master_loop(
     inputs,
     device,
-    streaming_request_queue,
-    nonstreaming_request_queue,
+    request_queue,
     batch_delay,
     interval_minutes=5,
 ):
@@ -322,14 +306,8 @@ def master_loop(
     while True:
         try:
             # Aggregate tasks from the request queues
-            if not streaming_request_queue.empty():
-                task = aggregate_tasks(
-                    streaming_request_queue, max_batch_size, interval_minutes
-                )
-            elif not nonstreaming_request_queue.empty():
-                task = aggregate_tasks(
-                    nonstreaming_request_queue, max_batch_size, interval_minutes
-                )
+            if not request_queue.empty():
+                task = aggregate_tasks(request_queue, max_batch_size)
             else:
                 # No tasks
                 if time.time() - last_sync_time > interval_minutes * 60:
@@ -355,7 +333,7 @@ def master_loop(
                 max_tokens,
                 settings,
                 message_queues,
-                streamer_queues,
+                response_queues,
                 input_lengths,
             ) = task
             input_len = inputs.shape[1]
@@ -380,7 +358,7 @@ def master_loop(
             dist.broadcast(attention_mask, 0)
 
             streamer = ChatServerTextStreamer(
-                tokenizer, streamer_queues, message_queues
+                tokenizer, response_queues, message_queues
             )
 
             if inputs.shape[0] > 1:
@@ -401,7 +379,7 @@ def master_loop(
             cache_manager.update(outputs)
 
             # Send signal to end the stream
-            for q in streamer.queues:
+            for q in response_queues:
                 q.put(None)
         except queue.Empty:
             # Send a keepalive signal
@@ -414,7 +392,7 @@ def master_loop(
             cache_manager.clear()
 
             # Send signal to end the stream
-            for q in streamer.queues:
+            for q in response_queues:
                 q.put(None)
 
 
@@ -507,10 +485,8 @@ def main(running_under_server=False):
     # Initialize the model serving thread loop
     if dist.get_rank() == 0:
         # Create request queues for users
-        global streaming_request_queue
-        global nonstreaming_request_queue
-        streaming_request_queue = queue.Queue()
-        nonstreaming_request_queue = queue.Queue()
+        global request_queue
+        request_queue = queue.Queue()
 
         # Start the keepalive thread
         gen_thread = threading.Thread(
@@ -518,8 +494,7 @@ def main(running_under_server=False):
             args=(
                 inputs,
                 device,
-                streaming_request_queue,
-                nonstreaming_request_queue,
+                request_queue,
                 args.batch_delay,
             ),
             daemon=True,
@@ -538,7 +513,7 @@ def main(running_under_server=False):
             print("Loop is over")
 
             # Send shutdown signal to main thread
-            streaming_request_queue.put(None)
+            request_queue.put(None)
             dist.destroy_process_group()
         else:
             atexit.register(dist.destroy_process_group)
