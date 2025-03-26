@@ -75,9 +75,6 @@ class DistributedLlama(nn.Module):
             self.model.to(dtype)
             self.model.eval()
 
-            # Prevent HF from applying its own compile step
-            self.model.get_compiled_call = lambda _: self.model.__call__
-
         # Setup tensor parallel model sharding
         if device_mesh.tp_size() > 1:
             self._shard_model()
@@ -164,29 +161,29 @@ class DistributedLlama(nn.Module):
         if pp_rank > 0:
             src_rank = self.device_mesh.coord_to_rank(pp_rank - 1, tp_rank)
 
-            def recv_hook(module, hidden_states):
-                tensor = hidden_states[0]
+            def recv_hook(module, in_hidden_states, out_hidden_states):
+                tensor = out_hidden_states
                 if isinstance(tensor, DTensor):
                     tensor = tensor._local_tensor
                 dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, src_rank)])[
                     0
                 ].wait()
 
-            local_blocks[0].register_forward_pre_hook(recv_hook)
+            self.model.model.embed_tokens.register_forward_hook(recv_hook)
 
         # Setup send hook for the last block
         if pp_rank < pp_size - 1:
             dst_rank = self.device_mesh.coord_to_rank(pp_rank + 1, tp_rank)
 
-            def send_hook(module, in_hidden_states, out_hidden_states):
-                tensor = out_hidden_states[0]
+            def send_hook(module, hidden_states):
+                tensor = hidden_states[0]
                 if isinstance(tensor, DTensor):
                     tensor = tensor._local_tensor
                 dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst_rank)])[
                     0
                 ].wait()
 
-            local_blocks[-1].register_forward_hook(send_hook)
+            self.model.model.norm.register_forward_pre_hook(send_hook)
 
         # Brodcast final output to all processes in the pipeline parallel group
         src_rank_for_bcast = self.device_mesh.coord_to_rank(-1, tp_rank)

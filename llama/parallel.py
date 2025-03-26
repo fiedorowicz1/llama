@@ -31,9 +31,9 @@ class LlamaDeviceMesh(DeviceMesh):
         :param tensor_parallel: The number of tensor parallel processes. Defaults to 1.
         :param pipeline_parallel: The number of pipeline parallel processes. Defaults to 1.
         """
-        assert (
-            tensor_parallel * pipeline_parallel == dist.get_world_size()
-        ), "world size must be equal to the product of tensor and pipeline parallelism"
+        assert tensor_parallel * pipeline_parallel == dist.get_world_size(), (
+            "world size must be equal to the product of tensor and pipeline parallelism"
+        )
         mesh_shape = (pipeline_parallel, tensor_parallel)
         with torch.device("cpu"):
             mesh = torch.arange(math.prod(mesh_shape), dtype=torch.int).view(mesh_shape)
